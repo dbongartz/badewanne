@@ -1,3 +1,5 @@
+[![CI](https://github.com/dbongartz/badewanne/actions/workflows/ci.yml/badge.svg)](https://github.com/dbongartz/badewanne/actions/workflows/ci.yml)
+
 # badewanne
 
 A `no_std`, lock-free, fixed-size object pool.
