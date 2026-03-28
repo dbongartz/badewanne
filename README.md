@@ -4,7 +4,8 @@
 
 A `no_std`, lock-free, fixed-size object pool.
 
-`Badewanne` (German for *bathtub*) pre-allocates `SIZE` slots on the stack.
+`Badewanne` [German for *bathtub*] pre-allocates `SIZE` slots.
+
 Values are placed into the pool via `Duck::new_in`, which returns a smart
 pointer that dereferences to `T` and returns the slot when dropped.
 
@@ -29,7 +30,5 @@ assert_eq!(&*c, "back");
 
 ## Properties
 
-- **`no_std`** -- no heap, no OS dependencies.
-- **Lock-free** -- slot acquisition uses atomic compare-and-swap.
-- **Thread-safe** -- `Badewanne` is `Send + Sync` when `T: Send`.
-- **RAII** -- `Duck` drops the value and releases the slot automatically.
+- `no_std` + `no-alloc`.
+- Lock-free and thread safe.
