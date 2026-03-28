@@ -2,192 +2,191 @@
 
 use core::{
     array,
+    borrow::Borrow,
     cell::UnsafeCell,
-    convert::{AsMut, AsRef},
+    fmt,
+    hash::{Hash, Hasher},
+    mem::MaybeUninit,
     ops::{Deref, DerefMut},
+    ptr::NonNull,
     sync::atomic::{AtomicBool, Ordering},
 };
 
-/// Thread-safe fixed-size object pool for byte buffers.
-///
-/// Manages `DUCKS` buffers of size `T` bytes each.
-/// Provides thread-safe allocation and deallocation via atomic flags.
-pub struct Badewanne<T, const DUCKS: usize> {
-    ducks: [UnsafeCell<T>; DUCKS],
-    swimming: [AtomicBool; DUCKS],
+pub struct Badewanne<T, const SIZE: usize> {
+    ducks: [UnsafeCell<MaybeUninit<T>>; SIZE],
+    swimming: [AtomicBool; SIZE],
 }
 
-impl<T, const DUCKS: usize> Badewanne<T, DUCKS> {
-    fn new_internal(ducks: [UnsafeCell<T>; DUCKS]) -> Self {
+impl<T, const SIZE: usize> Badewanne<T, SIZE> {
+    pub fn new() -> Self {
         Self {
-            ducks,
+            ducks: array::from_fn(|_| UnsafeCell::new(MaybeUninit::uninit())),
             swimming: array::from_fn(|_| AtomicBool::new(true)),
         }
     }
 
-    pub fn from_fn<F: FnMut(usize) -> T>(mut f: F) -> Self {
-        let ducks = array::from_fn(|i| UnsafeCell::new(f(i)));
-        Self::new_internal(ducks)
-    }
-}
-
-impl<T: Clone, const DUCKS: usize> Badewanne<T, DUCKS> {
-    pub fn with_init(initial: T) -> Self {
-        let ducks = array::from_fn(|_| UnsafeCell::new(initial.clone()));
-        Self::new_internal(ducks)
-    }
-}
-
-impl<T: Default, const DUCKS: usize> Badewanne<T, DUCKS> {
-    /// Creates a new pool with all buffers initially available.
-    pub fn new() -> Self {
-        let ducks = array::from_fn(|_| UnsafeCell::new(Default::default()));
-        Self::new_internal(ducks)
-    }
-}
-
-// impl<T, const DUCKS: usize> Badewanne<T, DUCKS>
-// where
-//     T: Copy, // for safety
-// {
-//     pub unsafe fn new_uninit() -> Self {
-//         Self {
-//             ducks: array::from_fn(|_| UnsafeCell::new(unsafe { core::mem::zeroed() })),
-//             swimming: array::from_fn(|_| AtomicBool::new(true)),
-//         }
-//     }
-// }
-
-impl<T, const DUCKS: usize> Badewanne<T, DUCKS> {
-    /// Attempts to allocate a buffer from the pool.
-    ///
-    /// Returns `Some(Duck)` if a buffer is available, `None` if all buffers are in use.
-    /// The returned `Duck` automatically releases the buffer when dropped.
-    pub fn try_grab_duck(&self) -> Option<Duck<'_, T, DUCKS>> {
+    fn grab_duck(&self) -> Option<(NonNull<MaybeUninit<T>>, &AtomicBool)> {
         self.swimming
             .iter()
-            .enumerate()
-            .find_map(|(slot_idx, used)| {
-                used.compare_exchange(true, false, Ordering::Acquire, Ordering::Acquire)
+            .zip(self.ducks.iter())
+            .find_map(|(flag, cell)| {
+                flag.compare_exchange(true, false, Ordering::Acquire, Ordering::Relaxed)
                     .ok()
-                    .map(|_| Duck::new(self, slot_idx))
+                    // SAFETY: UnsafeCell::get() is never null.
+                    .map(|_| (unsafe { NonNull::new_unchecked(cell.get()) }, flag))
             })
     }
 }
 
-impl<T: Default, const DUCKS: usize> Default for Badewanne<T, DUCKS> {
+// SAFETY: Badewanne owns T values inside UnsafeCell. Moving it across threads
+// moves those T values, and sharing it across threads allows acquiring Ducks
+// that give &mut T — both require T: Send.
+unsafe impl<T: Send, const SIZE: usize> Send for Badewanne<T, SIZE> {}
+unsafe impl<T: Send, const SIZE: usize> Sync for Badewanne<T, SIZE> {}
+
+impl<T, const SIZE: usize> Default for Badewanne<T, SIZE> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-/// Handle to an allocated buffer from the pool.
-///
-/// Provides exclusive mutable access to a `T`.
-/// Automatically returns the buffer to the pool when dropped.
-pub struct Duck<'a, T, const DUCKS: usize> {
-    wanne: &'a Badewanne<T, DUCKS>,
-    duck_idx: usize,
+pub struct Duck<'a, T> {
+    duck: NonNull<T>,
+    slot: &'a AtomicBool,
 }
 
-impl<'a, T, const DUCKS: usize> Drop for Duck<'a, T, DUCKS> {
-    fn drop(&mut self) {
-        // SAFETY: A Duck can only be obtained from the Badewanne so it is safe to index directly
-        self.wanne.swimming[self.duck_idx].store(true, Ordering::Release);
-    }
-}
-
-impl<'a, T, const DUCKS: usize> Duck<'a, T, DUCKS> {
-    fn new(wanne: &'a Badewanne<T, DUCKS>, slot: usize) -> Self {
-        Self {
-            wanne,
-            duck_idx: slot,
-        }
-    }
-
-    fn as_ref(&self) -> &T {
-        // SAFETY: Each Duck has exclusive access to its slot via the atomic flag
-        // in the Badewanne's swimming array, so no other Duck or thread can access
-        // this slot simultaneously.
-        unsafe { &*self.wanne.ducks[self.duck_idx].get() }
-    }
-
-    fn as_ref_mut(&mut self) -> &mut T {
-        // SAFETY: Each Duck has exclusive access to its slot via the atomic flag
-        // in the Badewanne's swimming array, so no other Duck or thread can access
-        // this slot simultaneously.
-        unsafe { &mut *self.wanne.ducks[self.duck_idx].get() }
+impl<'a, T> Duck<'a, T> {
+    pub fn new_in<const SIZE: usize>(x: T, wanne: &'a Badewanne<T, SIZE>) -> Option<Self> {
+        wanne.grab_duck().map(|(mut ptr, slot)| {
+            // SAFETY: We have exclusive access to this slot via the atomic flag.
+            unsafe { ptr.as_mut().write(x) };
+            Self {
+                duck: ptr.cast::<T>(),
+                slot,
+            }
+        })
     }
 }
 
-// SAFETY: Badewanne can be shared between threads because:
-// 1. The AtomicBool in `used` array provides synchronization
-// 2. Each Duck has exclusive access to its slot via the atomic flag
-// 3. The UnsafeCell slots are only accessed through the synchronized `used` flags
-unsafe impl<T, const DUCKS: usize> Sync for Badewanne<T, DUCKS> {}
-
-// SAFETY: Badewanne can be sent between threads because:
-// 1. It only contains Send types (UnsafeCell and AtomicBool)
-// 2. No thread-specific data or resources
-unsafe impl<T, const DUCKS: usize> Send for Badewanne<T, DUCKS> {}
-
-// SAFETY: Duck can be sent between threads because:
-// 1. It contains a reference to Badewanne (which is Sync)
-// 2. The Duck has exclusive access to its slot via atomic flag
-// 3. No thread-specific data or resources
-unsafe impl<'a, T, const DUCKS: usize> Send for Duck<'a, T, DUCKS> {}
-
-impl<'a, T, const DUCKS: usize> Deref for Duck<'a, T, DUCKS> {
+impl<T> Deref for Duck<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        self.as_ref()
+        // SAFETY: duck points to an initialized T and we hold shared access (&self).
+        // No mutable alias can exist simultaneously (DerefMut requires &mut self).
+        unsafe { self.duck.as_ref() }
     }
 }
 
-impl<'a, T, const DUCKS: usize> DerefMut for Duck<'a, T, DUCKS> {
+impl<T> DerefMut for Duck<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.as_ref_mut()
+        // SAFETY: duck points to an initialized T and we hold exclusive access (&mut self).
+        unsafe { self.duck.as_mut() }
     }
 }
 
-impl<'a, T, const DUCKS: usize> AsRef<T> for Duck<'a, T, DUCKS> {
+impl<T> AsRef<T> for Duck<'_, T> {
     fn as_ref(&self) -> &T {
-        self.as_ref()
+        self
     }
 }
 
-impl<'a, T, const DUCKS: usize> AsMut<T> for Duck<'a, T, DUCKS> {
+impl<T> AsMut<T> for Duck<'_, T> {
     fn as_mut(&mut self) -> &mut T {
-        self.as_ref_mut()
+        self
+    }
+}
+
+impl<T: fmt::Debug> fmt::Debug for Duck<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&**self, f)
+    }
+}
+
+impl<T: fmt::Display> fmt::Display for Duck<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&**self, f)
+    }
+}
+
+impl<T: fmt::Pointer> fmt::Pointer for Duck<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Pointer::fmt(&**self, f)
+    }
+}
+
+impl<T: PartialEq> PartialEq for Duck<'_, T> {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl<T: Hash> Hash for Duck<'_, T> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        (**self).hash(state)
+    }
+}
+
+impl<T> Borrow<T> for Duck<'_, T> {
+    fn borrow(&self) -> &T {
+        self
+    }
+}
+
+// SAFETY: Sending a Duck sends exclusive (&mut T) access to another thread:
+// requires T: Send. Sharing &Duck exposes &T via Deref: requires T: Sync.
+unsafe impl<'a, T: Send> Send for Duck<'a, T> {}
+unsafe impl<'a, T: Sync> Sync for Duck<'a, T> {}
+
+impl<T> Drop for Duck<'_, T> {
+    fn drop(&mut self) {
+        // SAFETY: duck was initialized in new_in and this Drop runs exactly once.
+        unsafe { core::ptr::drop_in_place(self.duck.as_ptr()) };
+        self.slot.store(true, Ordering::Release);
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
     use super::*;
 
     #[test]
-    fn api() {
-        let wanne = Badewanne::<[u8; 256], 8>::with_init([0u8; 256]);
-        let mut duck0 = wanne.try_grab_duck().unwrap();
-        let duck1 = wanne.try_grab_duck().unwrap();
-        duck0[1] = 1; // Can use [] operator via DerefMut
-        drop(duck1);
-        duck0[0] = 1;
+    fn multi_slot() {
+        let wanne = Badewanne::<u32, 4>::new();
+
+        let d0 = Duck::new_in(0u32, &wanne).unwrap();
+        let d1 = Duck::new_in(1u32, &wanne).unwrap();
+        let d2 = Duck::new_in(2u32, &wanne).unwrap();
+        let d3 = Duck::new_in(3u32, &wanne).unwrap();
+
+        // Pool is full — next grab must fail
+        assert!(Duck::new_in(99u32, &wanne).is_none());
+
+        // Dropping one slot makes it available again
+        drop(d2);
+        assert!(Duck::new_in(99u32, &wanne).is_some());
+
+        drop(d0);
+        drop(d1);
+        drop(d3);
     }
 
     #[test]
     fn multi_threaded() {
-        let wanne = Badewanne::<[u8; 256], 8>::from_fn(|_| [0u8; 256]);
+        let wanne = Badewanne::<u32, 8>::new();
 
         std::thread::scope(|s| {
             for i in 0..8 {
                 s.spawn({
                     let wanne = &wanne;
                     move || {
-                        let mut duck = wanne.try_grab_duck().unwrap();
-                        duck[0] = i as u8; // Can use [] operator thanks to DerefMut
+                        let duck = Duck::new_in(i as u32, wanne).unwrap();
+                        assert_eq!(*duck, i as u32);
                     }
                 });
             }
@@ -195,53 +194,63 @@ mod tests {
     }
 
     #[test]
-    fn deref_traits() {
-        let wanne = Badewanne::<[u8; 256], 8>::with_init([0u8; 256]);
-        let mut duck = wanne.try_grab_duck().unwrap();
+    fn drop_calls_destructor() {
+        let drop_cnt = Arc::new(AtomicUsize::new(0));
 
-        // Can use slice methods directly via Deref
-        assert_eq!(duck.len(), 256);
-        assert!(!duck.is_empty());
+        struct Droppable(Arc<AtomicUsize>);
+        impl Drop for Droppable {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
 
-        // Can use [] operator via DerefMut
-        duck[0] = 42;
-        assert_eq!(duck[0], 42);
+        let wanne = Badewanne::<Droppable, 2>::new();
+        let d0 = Duck::new_in(Droppable(drop_cnt.clone()), &wanne).unwrap();
+        let d1 = Duck::new_in(Droppable(drop_cnt.clone()), &wanne).unwrap();
 
-        // Can use AsRef/AsMut
-        let _: &[u8] = duck.as_ref();
-        let _: &mut [u8] = duck.as_mut();
+        assert_eq!(drop_cnt.load(Ordering::Relaxed), 0);
+        drop(d0);
+        assert_eq!(
+            drop_cnt.load(Ordering::Relaxed),
+            1,
+            "destructor must run on Duck drop"
+        );
+        drop(d1);
+        assert_eq!(
+            drop_cnt.load(Ordering::Relaxed),
+            2,
+            "destructor must run on Duck drop"
+        );
+
+        // Both slots were returned — pool must be full again
+        let _da = Duck::new_in(Droppable(drop_cnt.clone()), &wanne).unwrap();
+        let _db = Duck::new_in(Droppable(drop_cnt.clone()), &wanne).unwrap();
+        assert!(Duck::new_in(Droppable(drop_cnt.clone()), &wanne).is_none());
     }
 
     #[test]
-    fn generic_type() {
-        #[derive(Debug, Default, Clone, PartialEq, Eq)]
-        struct MyStruct {
-            value: i32,
-            name: &'static str,
+    fn drop_pool_destroys_no_uninit_slots() {
+        // When the pool drops, it must not run T's destructor on uninit slots.
+        let drop_cnt = Arc::new(AtomicUsize::new(0));
+
+        struct Droppable(Arc<AtomicUsize>);
+        impl Drop for Droppable {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
         }
 
-        // Test new() constructor
-        let pool = Badewanne::<MyStruct, 4>::new();
-        let duck = pool.try_grab_duck().unwrap();
-        assert_eq!(*duck, MyStruct { value: 0, name: "" });
-
-        // Test with_init() constructor
-        let pool: Badewanne<MyStruct, 1> = Badewanne::with_init(MyStruct { value: 42, name: "test" });
-        let mut duck = pool.try_grab_duck().unwrap();
-        assert_eq!(*duck, MyStruct { value: 42, name: "test" });
-        duck.value = 100;
-        drop(duck);
-
-        // Verify slot was returned
-        let duck = pool.try_grab_duck().unwrap();
-        assert_eq!(duck.value, 100);
-
-        // Test from_fn() constructor
-        let pool: Badewanne<MyStruct, 4> = Badewanne::from_fn(|i| MyStruct { value: i as i32, name: "fn" });
-        for _ in 0..4 {
-            let duck = pool.try_grab_duck().unwrap();
-            assert_eq!(duck.name, "fn");
-            drop(duck);
+        {
+            let wanne = Badewanne::<Droppable, 4>::new();
+            let d = Duck::new_in(Droppable(drop_cnt.clone()), &wanne).unwrap();
+            drop(d); // destructor runs here, slot goes back to uninit
+            // wanne drops here with all slots uninit — must not call destructor again
         }
+
+        assert_eq!(
+            drop_cnt.load(Ordering::Relaxed),
+            1,
+            "destructor must run exactly once"
+        );
     }
 }
