@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "0 2 * * *" # nightly at 02:00 UTC
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # For scheduled runs, check whether main has received any commits in the
+  # last 24 hours. The ci job skips itself if there are none.
+  # For all other triggers this job is skipped and ci always runs.
+  check-changes:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    outputs:
+      has_changes: ${{ steps.check.outputs.has_changes }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - id: check
+        run: |
+          if git log --since="24 hours ago" --oneline | grep -q .; then
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          fi
+
+  ci:
+    name: Check, Lint, Test
+    runs-on: ubuntu-latest
+    needs: [check-changes]
+    # always() lets this job run even when check-changes was skipped (non-schedule events).
+    # For scheduled runs it proceeds only when check-changes found recent commits.
+    if: |
+      always() && (
+        github.event_name != 'schedule' ||
+        needs.check-changes.outputs.has_changes == 'true'
+      )
+
+    steps:
+      # 1. Check out your code onto the runner machine.
+      - uses: actions/checkout@v5
+
+      # 2. Install the Rust toolchain.
+      #    `stable` gives you the current stable release.
+      #    We add the `rustfmt` and `clippy` components explicitly because
+      #    they are not always present in the minimal toolchain image.
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # 3. Cache compiled dependencies so subsequent runs are faster.
+      #    Without this, every run recompiles every dependency from scratch.
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+
+      # 4. Formatting check.
+      #    `--check` exits non-zero if any file would be reformatted,
+      #    without actually writing anything.
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      # 5. Linting.
+      #    `--deny warnings` turns any Clippy warning into an error,
+      #    so the job fails rather than silently passing with warnings.
+      - name: Clippy
+        run: cargo clippy --all-targets -- --deny warnings
+
+      # 6. Tests (includes doc-tests).
+      - name: Test
+        run: cargo test --all
+
+      # 7. Docs build.
+      #    RUSTDOCFLAGS="-D warnings" fails the build if any doc warning
+      #    appears (e.g. a broken intra-doc link).
+      - name: Doc
+        run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
