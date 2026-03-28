@@ -1,5 +1,30 @@
 #![cfg_attr(not(test), no_std)]
 
+//! A `no_std`, lock-free, fixed-size object pool.
+//!
+//! [`Badewanne`] pre-allocates `SIZE` slots on the stack. Values are placed into
+//! the pool via [`Duck::new_in`], which returns a smart pointer that
+//! dereferences to `T` and returns the slot when dropped.
+//!
+//! # Example
+//!
+//! ```
+//! use badewanne::{Badewanne, Duck};
+//!
+//! let pool = Badewanne::<String, 2>::new();
+//!
+//! let a = Duck::new_in("hello".into(), &pool).expect("pool has space");
+//! let b = Duck::new_in("world".into(), &pool).expect("pool has space");
+//!
+//! // Pool is full.
+//! assert!(Duck::new_in("!".into(), &pool).is_none());
+//!
+//! // Dropping a duck frees its slot.
+//! drop(a);
+//! let c = Duck::new_in("back".into(), &pool).expect("slot freed");
+//! assert_eq!(&*c, "back");
+//! ```
+
 use core::{
     array,
     borrow::Borrow,
@@ -12,12 +37,17 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
+/// A fixed-size, lock-free object pool with `SIZE` slots.
+///
+/// Thread-safe when `T: Send`. Slots are acquired atomically and
+/// returned automatically when the corresponding [`Duck`] is dropped.
 pub struct Badewanne<T, const SIZE: usize> {
     ducks: [UnsafeCell<MaybeUninit<T>>; SIZE],
     swimming: [AtomicBool; SIZE],
 }
 
 impl<T, const SIZE: usize> Badewanne<T, SIZE> {
+    /// Creates an empty pool with all `SIZE` slots available.
     pub fn new() -> Self {
         Self {
             ducks: array::from_fn(|_| UnsafeCell::new(MaybeUninit::uninit())),
@@ -50,12 +80,19 @@ impl<T, const SIZE: usize> Default for Badewanne<T, SIZE> {
     }
 }
 
+/// A smart pointer to a value stored in a [`Badewanne`] slot.
+///
+/// Dereferences to `T`. When dropped, the value is destroyed and the slot
+/// is returned to the pool.
 pub struct Duck<'a, T> {
     duck: NonNull<T>,
     slot: &'a AtomicBool,
 }
 
 impl<'a, T> Duck<'a, T> {
+    /// Places `x` into the first available slot in `wanne`.
+    ///
+    /// Returns `None` if all slots are occupied.
     pub fn new_in<const SIZE: usize>(x: T, wanne: &'a Badewanne<T, SIZE>) -> Option<Self> {
         wanne.grab_duck().map(|(mut ptr, slot)| {
             // SAFETY: We have exclusive access to this slot via the atomic flag.
