@@ -2,5 +2,4 @@
 name = "badewanne"
 version = "0.1.0"
 edition = "2024"
-
-[dependencies]
+description = "A `no_std`, lock-free, fixed-size object pool."
